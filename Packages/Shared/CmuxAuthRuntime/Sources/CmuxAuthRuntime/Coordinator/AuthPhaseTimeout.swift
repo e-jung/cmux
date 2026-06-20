@@ -1,22 +1,21 @@
 import Foundation
 internal import os
 
-private let authPhaseTimeoutCleanupRegistry = AuthPhaseTimeoutCleanupRegistry()
+actor AuthPhaseTimeoutRegistry {
+    private var timedOutPhases: [String: UUID] = [:]
 
-private actor AuthPhaseTimeoutCleanupRegistry {
-    private var timedOutOperationIDs: [String: UUID] = [:]
-
-    func hasTimedOutOperation(for phase: AuthPhase) -> Bool {
-        timedOutOperationIDs[phase.rawValue] != nil
+    func canBegin(_ phase: AuthPhase) -> Bool {
+        timedOutPhases[phase.rawValue] == nil
     }
 
-    func trackTimedOutOperation(for phase: AuthPhase, id: UUID) {
-        timedOutOperationIDs[phase.rawValue] = id
+    func markTimedOut(_ phase: AuthPhase, id: UUID) {
+        timedOutPhases[phase.rawValue] = id
     }
 
-    func clearTimedOutOperation(for phase: AuthPhase, id: UUID) {
-        guard timedOutOperationIDs[phase.rawValue] == id else { return }
-        timedOutOperationIDs[phase.rawValue] = nil
+    func end(_ phase: AuthPhase, id: UUID) {
+        let key = phase.rawValue
+        guard timedOutPhases[key] == id else { return }
+        timedOutPhases[key] = nil
     }
 }
 
@@ -128,11 +127,13 @@ func withAuthPhaseTimeout<T: Sendable>(
     duration: Duration,
     clock: any Clock<Duration>,
     log: AuthDebugLog,
+    registry: AuthPhaseTimeoutRegistry,
     operation: @escaping @Sendable () async throws -> T
 ) async throws -> T {
     try Task.checkCancellation()
-    if await authPhaseTimeoutCleanupRegistry.hasTimedOutOperation(for: phase) {
-        log.log("auth.phase=\(phase.rawValue) previous timed-out operation still cleaning up")
+    let phaseID = UUID()
+    guard await registry.canBegin(phase) else {
+        log.log("auth.phase=\(phase.rawValue) previous timed-out operation still active")
         throw AuthError.timedOut
     }
     let state = AuthPhaseTimeoutState<T>()
@@ -140,6 +141,11 @@ func withAuthPhaseTimeout<T: Sendable>(
         try await withCheckedThrowingContinuation { continuation in
             state.install(continuation)
             let operationTask = Task {
+                defer {
+                    Task {
+                        await registry.end(phase, id: phaseID)
+                    }
+                }
                 do {
                     state.resume(returning: try await operation())
                 } catch {
@@ -153,25 +159,9 @@ func withAuthPhaseTimeout<T: Sendable>(
                     return
                 }
                 log.log("auth.phase=\(phase.rawValue) timed out after \(duration)")
-                let cleanupID = UUID()
-                await authPhaseTimeoutCleanupRegistry.trackTimedOutOperation(
-                    for: phase,
-                    id: cleanupID
-                )
-                if state.resume(throwing: AuthError.timedOut) {
-                    Task {
-                        operationTask.cancel()
-                        await operationTask.value
-                        await authPhaseTimeoutCleanupRegistry.clearTimedOutOperation(
-                            for: phase,
-                            id: cleanupID
-                        )
-                    }
-                } else {
-                    await authPhaseTimeoutCleanupRegistry.clearTimedOutOperation(
-                        for: phase,
-                        id: cleanupID
-                    )
+                await registry.markTimedOut(phase, id: phaseID)
+                if !state.resume(throwing: AuthError.timedOut) {
+                    await registry.end(phase, id: phaseID)
                 }
             }
             state.setCancelHandler {

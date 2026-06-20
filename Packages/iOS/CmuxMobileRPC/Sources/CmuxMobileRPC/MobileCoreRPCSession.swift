@@ -5,9 +5,8 @@ import Foundation
 /// requests by id, and dispatches server-pushed events to registered listeners.
 ///
 /// No polling: the reader task runs continuously, parking on `transport.receive()`
-/// until the kernel delivers bytes. There is no `Task.sleep` or `asyncAfter`
-/// anywhere in this class; the only `Task.sleep` in the package is the
-/// race-deadline in `MobileCoreRPCClient.withRequestTimeout`.
+/// until the kernel delivers bytes. Request deadlines are attached to pending
+/// continuations so a hung transport cannot keep the caller waiting forever.
 actor MobileCoreRPCSession {
     typealias TransportFactory = @Sendable () throws -> any CmxByteTransport
     typealias PendingContinuation = CheckedContinuation<Result<Data, MobileShellConnectionError>, Never>
@@ -29,10 +28,11 @@ actor MobileCoreRPCSession {
 
     private let makeTransport: TransportFactory
     private var transport: (any CmxByteTransport)?
-    private var connectionTask: (id: UUID, task: Task<any CmxByteTransport, any Error>)?
+    private var connectionTask: (id: UUID, task: Task<any CmxByteTransport, any Error>, waiters: Int, timedOut: Bool)?
     private var installedConnectionID: UUID?
     private var readerTask: Task<Void, Never>?
     private var pending: [String: PendingContinuation] = [:]
+    private var requestTimeoutTasks: [String: Task<Void, Never>] = [:]
     private var queuedRequestIDs: Set<String> = []
     private var cancelledQueuedRequestIDs: Set<String> = []
     private var listeners: [UUID: EventListener] = [:]
@@ -55,9 +55,12 @@ actor MobileCoreRPCSession {
         writeQueue?.finish()
     }
 
-    func send(payload: Data, requestID: String) async throws -> Data {
-        _ = try await ensureConnected()
+    func send(payload: Data, requestID: String, deadlineUptimeNanoseconds: UInt64) async throws -> Data {
+        _ = try await ensureConnected(
+            timeoutNanoseconds: try Self.remainingNanoseconds(until: deadlineUptimeNanoseconds)
+        )
         let frame = try MobileSyncFrameCodec.encodeFrame(payload)
+        let responseTimeoutNanoseconds = try Self.remainingNanoseconds(until: deadlineUptimeNanoseconds)
 
         let result: Result<Data, MobileShellConnectionError> = await withTaskCancellationHandler {
             await withCheckedContinuation { continuation in
@@ -66,7 +69,20 @@ actor MobileCoreRPCSession {
                 // from `writeQueue`, so concurrent senders never overlap a
                 // `transport.send()` call.
                 pending[requestID] = continuation
+                requestTimeoutTasks[requestID]?.cancel()
+                requestTimeoutTasks[requestID] = Task { [weak self] in
+                    do {
+                        try await Task.sleep(nanoseconds: responseTimeoutNanoseconds)
+                    } catch {
+                        return
+                    }
+                    guard let self else { return }
+                    if await self.timeoutPendingRequest(requestID: requestID) {
+                        await self.tearDown(error: .connectionClosed)
+                    }
+                }
                 guard let queue = writeQueue else {
+                    requestTimeoutTasks.removeValue(forKey: requestID)?.cancel()
                     pending.removeValue(forKey: requestID)
                     continuation.resume(returning: .failure(.connectionClosed))
                     return
@@ -110,8 +126,13 @@ actor MobileCoreRPCSession {
         isTearingDown = true
         let pendingSnapshot = pending
         pending.removeAll()
+        let timeoutSnapshot = requestTimeoutTasks
+        requestTimeoutTasks.removeAll()
         queuedRequestIDs.removeAll()
         cancelledQueuedRequestIDs.removeAll()
+        for (_, task) in timeoutSnapshot {
+            task.cancel()
+        }
         for (_, cont) in pendingSnapshot {
             cont.resume(returning: .failure(error))
         }
@@ -141,14 +162,18 @@ actor MobileCoreRPCSession {
 
     // MARK: - private
 
-    private func ensureConnected() async throws -> any CmxByteTransport {
+    private func ensureConnected(timeoutNanoseconds: UInt64) async throws -> any CmxByteTransport {
         if let transport { return transport }
 
         let connectionID: UUID
         let task: Task<any CmxByteTransport, any Error>
         if let existing = connectionTask {
+            guard !existing.timedOut else {
+                throw MobileShellConnectionError.requestTimedOut
+            }
             connectionID = existing.id
             task = existing.task
+            connectionTask?.waiters += 1
         } else {
             let candidate = try makeTransport()
             connectionID = UUID()
@@ -163,20 +188,32 @@ actor MobileCoreRPCSession {
                     }
                 }
             }
-            connectionTask = (id: connectionID, task: task)
+            connectionTask = (id: connectionID, task: task, waiters: 1, timedOut: false)
+            Task.detached { [weak self] in
+                _ = await task.result
+                await self?.clearTimedOutConnecting(id: connectionID)
+            }
         }
 
         let candidate: any CmxByteTransport
         do {
             candidate = try await withTaskCancellationHandler {
-                try await task.value
+                if connectionTask?.timedOut == true {
+                    throw MobileShellConnectionError.requestTimedOut
+                }
+                let candidate = try await Self.awaitTaskValue(task, timeoutNanoseconds: timeoutNanoseconds)
+                try Task.checkCancellation()
+                return candidate
             } onCancel: {
                 Task {
-                    await self.cancelConnecting(id: connectionID)
+                    await self.cancelConnectingWaiter(id: connectionID)
                 }
             }
         } catch {
-            if connectionTask?.id == connectionID {
+            if case MobileShellConnectionError.requestTimedOut = error {
+                markConnectingTimedOut(id: connectionID)
+                task.cancel()
+            } else if connectionTask?.id == connectionID {
                 connectionTask = nil
             }
             throw error
@@ -213,11 +250,27 @@ actor MobileCoreRPCSession {
         return candidate
     }
 
-    private func cancelConnecting(id connectionID: UUID) {
+    private func cancelConnectingWaiter(id connectionID: UUID) {
         guard transport == nil, connectionTask?.id == connectionID else {
             return
         }
+        connectionTask?.waiters -= 1
+        guard let waiters = connectionTask?.waiters, waiters <= 0 else {
+            return
+        }
         connectionTask?.task.cancel()
+        connectionTask = nil
+    }
+
+    private func markConnectingTimedOut(id connectionID: UUID) {
+        guard transport == nil, connectionTask?.id == connectionID, let task = connectionTask?.task else {
+            return
+        }
+        connectionTask = (id: connectionID, task: task, waiters: 0, timedOut: true)
+    }
+
+    private func clearTimedOutConnecting(id connectionID: UUID) {
+        guard connectionTask?.id == connectionID, connectionTask?.timedOut == true else { return }
         connectionTask = nil
     }
 
@@ -287,6 +340,7 @@ actor MobileCoreRPCSession {
         }
         guard let id = envelope["id"] as? String else { return }
         guard let cont = pending.removeValue(forKey: id) else { return }
+        requestTimeoutTasks.removeValue(forKey: id)?.cancel()
         if (envelope["ok"] as? Bool) == true {
             let result = envelope["result"] ?? [:]
             if let data = try? JSONSerialization.data(withJSONObject: result) {
@@ -314,15 +368,27 @@ actor MobileCoreRPCSession {
 
     private func failPending(requestID: String, error: MobileShellConnectionError) {
         guard let cont = pending.removeValue(forKey: requestID) else { return }
+        requestTimeoutTasks.removeValue(forKey: requestID)?.cancel()
         cont.resume(returning: .failure(error))
     }
 
     private func cancelPendingRequest(requestID: String) {
         guard let cont = pending.removeValue(forKey: requestID) else { return }
+        requestTimeoutTasks.removeValue(forKey: requestID)?.cancel()
         if queuedRequestIDs.remove(requestID) != nil {
             cancelledQueuedRequestIDs.insert(requestID)
         }
         cont.resume(returning: .failure(.requestTimedOut))
+    }
+
+    private func timeoutPendingRequest(requestID: String) -> Bool {
+        guard let cont = pending.removeValue(forKey: requestID) else { return false }
+        requestTimeoutTasks.removeValue(forKey: requestID)?.cancel()
+        if queuedRequestIDs.remove(requestID) != nil {
+            cancelledQueuedRequestIDs.insert(requestID)
+        }
+        cont.resume(returning: .failure(.requestTimedOut))
+        return true
     }
 
     private func shouldSendQueuedWrite(requestID: String) -> Bool {
@@ -331,5 +397,45 @@ actor MobileCoreRPCSession {
             return false
         }
         return wasQueued && pending[requestID] != nil
+    }
+
+    private nonisolated static func awaitTaskValue<T: Sendable>(
+        _ task: Task<T, any Error>,
+        timeoutNanoseconds: UInt64
+    ) async throws -> T {
+        let stream = AsyncThrowingStream<T, any Error> { continuation in
+            let valueTask = Task {
+                do {
+                    continuation.yield(try await task.value)
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            let timeoutTask = Task {
+                do {
+                    try await Task.sleep(nanoseconds: timeoutNanoseconds)
+                } catch {
+                    return
+                }
+                continuation.finish(throwing: MobileShellConnectionError.requestTimedOut)
+            }
+            continuation.onTermination = { _ in
+                valueTask.cancel()
+                timeoutTask.cancel()
+            }
+        }
+        for try await value in stream {
+            return value
+        }
+        throw MobileShellConnectionError.requestTimedOut
+    }
+
+    private nonisolated static func remainingNanoseconds(until deadlineUptimeNanoseconds: UInt64) throws -> UInt64 {
+        let now = DispatchTime.now().uptimeNanoseconds
+        guard now < deadlineUptimeNanoseconds else {
+            throw MobileShellConnectionError.requestTimedOut
+        }
+        return deadlineUptimeNanoseconds - now
     }
 }

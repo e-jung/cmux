@@ -68,6 +68,7 @@ public final class AuthCoordinator {
     private let isOnline: @Sendable () async -> Bool
     private let onSignedIn: @Sendable () async -> Void
     private let log = AuthDebugLog()
+    private let phaseTimeoutRegistry = AuthPhaseTimeoutRegistry()
 
     private var pendingNonce: String?
     var debugCredentials: CMUXAuthAutoLoginCredentials?
@@ -685,6 +686,7 @@ public final class AuthCoordinator {
             duration: timeout,
             clock: clock,
             log: log,
+            registry: phaseTimeoutRegistry,
             operation: operation
         )
     }

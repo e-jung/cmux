@@ -5,51 +5,6 @@ import Testing
 @testable import CmuxMobileRPC
 
 @Suite struct MobileCoreRPCClientTests {
-    @Test func rpcRequestTimeoutCancelsOperationWhenCallerIsCancelled() async throws {
-        let started = AsyncFlag()
-        let cancelled = AsyncFlag()
-        let task = Task {
-            try await MobileCoreRPCClient.debugWithRequestTimeout(
-                timeoutNanoseconds: 60 * 1_000_000_000
-            ) {
-                await started.set()
-                do {
-                    try await Task.sleep(nanoseconds: 60 * 1_000_000_000)
-                    return "completed"
-                } catch {
-                    await cancelled.set()
-                    throw error
-                }
-            }
-        }
-
-        for _ in 0..<100 {
-            if await started.isSet() {
-                break
-            }
-            try await Task.sleep(nanoseconds: 1_000_000)
-        }
-        #expect(await started.isSet())
-
-        task.cancel()
-
-        do {
-            _ = try await task.value
-            Issue.record("Expected cancelled RPC timeout wrapper to throw")
-        } catch is CancellationError {
-        } catch {
-            Issue.record("Expected CancellationError, got \(error)")
-        }
-
-        for _ in 0..<100 {
-            if await cancelled.isSet() {
-                break
-            }
-            try await Task.sleep(nanoseconds: 1_000_000)
-        }
-        #expect(await cancelled.isSet())
-    }
-
     @Test func cancelledQueuedRPCIsNotWrittenAfterEarlierSendCompletes() async throws {
         let transport = QueuedCancellationProbeTransport()
         let route = try hostPortRoute(kind: .debugLoopback, host: "127.0.0.1", port: 59123)
@@ -269,6 +224,127 @@ import Testing
 
         #expect(await tokenStarted.isSet())
         #expect(try await transport.sentRequests().isEmpty)
+    }
+
+    @Test func timedOutStackTokenProviderIsNotStartedAgainForSameClient() async throws {
+        let tokenProvider = CancellationIgnoringTokenProvider()
+        let transport = QueuedCancellationProbeTransport()
+        let route = try hostPortRoute(kind: .debugLoopback, host: "127.0.0.1", port: 59127)
+        let runtime = TestMobileSyncRuntime(
+            transportFactory: QueuedCancellationProbeTransportFactory(transport: transport),
+            stackAccessTokenProvider: {
+                try await tokenProvider.token()
+            },
+            rpcRequestTimeoutNanoseconds: 10_000_000
+        )
+        let ticket = try CmxAttachTicket(
+            workspaceID: "workspace-main",
+            terminalID: "terminal-main",
+            macDeviceID: "test-mac",
+            macDisplayName: "Test Mac",
+            routes: [route],
+            expiresAt: Date().addingTimeInterval(60),
+            authToken: "ticket-secret"
+        )
+        let client = MobileCoreRPCClient(
+            runtime: runtime,
+            route: route,
+            ticket: ticket,
+            allowsStackAuthFallback: true
+        )
+        let request = try MobileCoreRPCClient.requestData(
+            method: "terminal.input",
+            params: [
+                "workspace_id": "workspace-main",
+                "terminal_id": "terminal-main",
+                "text": "needs-token",
+            ],
+            id: "needs-token"
+        )
+
+        do {
+            _ = try await client.sendRequest(request)
+            Issue.record("Expected first token request to time out")
+        } catch MobileShellConnectionError.requestTimedOut {
+        } catch {
+            Issue.record("Expected requestTimedOut, got \(error)")
+        }
+        #expect(await tokenProvider.startCount == 1)
+
+        do {
+            _ = try await client.sendRequest(request)
+            Issue.record("Expected second token request to time out")
+        } catch MobileShellConnectionError.requestTimedOut {
+        } catch {
+            Issue.record("Expected requestTimedOut, got \(error)")
+        }
+        #expect(await tokenProvider.startCount == 1)
+        #expect(try await transport.sentRequests().isEmpty)
+
+        await tokenProvider.release()
+    }
+
+    @Test func timedOutOptionalHostStatusTokenDoesNotPoisonRequiredAuth() async throws {
+        let tokenProvider = FirstCallHangsTokenProvider()
+        let transport = QueuedCancellationProbeTransport()
+        let route = try hostPortRoute(kind: .debugLoopback, host: "127.0.0.1", port: 59128)
+        let runtime = TestMobileSyncRuntime(
+            transportFactory: QueuedCancellationProbeTransportFactory(transport: transport),
+            stackAccessTokenProvider: {
+                try await tokenProvider.token()
+            },
+            rpcRequestTimeoutNanoseconds: 60 * 1_000_000_000
+        )
+        let ticket = try CmxAttachTicket(
+            workspaceID: "workspace-main",
+            terminalID: "terminal-main",
+            macDeviceID: "test-mac",
+            macDisplayName: "Test Mac",
+            routes: [route],
+            expiresAt: Date().addingTimeInterval(60),
+            authToken: "ticket-secret"
+        )
+        let client = MobileCoreRPCClient(
+            runtime: runtime,
+            route: route,
+            ticket: ticket,
+            allowsStackAuthFallback: true
+        )
+        let status = try MobileCoreRPCClient.requestData(
+            method: "mobile.host.status",
+            params: [:],
+            id: "status"
+        )
+
+        do {
+            _ = try await client.sendRequest(status, timeoutNanoseconds: 10_000_000)
+            Issue.record("Expected optional host-status token lookup to consume the short request deadline")
+        } catch MobileShellConnectionError.requestTimedOut {
+        } catch {
+            Issue.record("Expected requestTimedOut, got \(error)")
+        }
+        #expect(await tokenProvider.startCount == 1)
+
+        let input = try MobileCoreRPCClient.requestData(
+            method: "terminal.input",
+            params: [
+                "workspace_id": "workspace-main",
+                "terminal_id": "terminal-main",
+                "text": "after-status",
+            ],
+            id: "after-status"
+        )
+        let inputTask = Task {
+            try await client.sendRequest(input)
+        }
+        let sent = try await transport.waitForSentRequestCount(1)
+        #expect(sent.first?.method == "terminal.input")
+        #expect(sent.first?.stackAccessToken == "second-token")
+        #expect(await tokenProvider.startCount == 2)
+
+        inputTask.cancel()
+        _ = try? await inputTask.value
+        await tokenProvider.release()
     }
 
     @Test func workspaceListResponseDecodesSnakeCaseWireShape() throws {
